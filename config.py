@@ -2,32 +2,41 @@ from pyrogram import Client, filters
 from pyrogram.types import ChatPermissions
 from pymongo import MongoClient
 import time
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # KONFIGURASI BOT
 API_ID = 23746013
 API_HASH = ""
 BOT_TOKEN = ""
 MONGO_URI = ""
+LOG_CHANNEL = -1002690553118
 
-# ROLE YANG BOLEH PAKAI PERINTAH
-SUDO_USERS = [7742582171]
-SUPPORT_USERS = [7742582171]
-WHITELIST = [7742582171]
+# ROLE
+SUDO_USERS = [7742582171, 7881514020]
+SUPPORT_USERS = [7742582171, 7881514020]
+WHITELIST = [7742582171, 7881514020]
 OWNER_ID = 7742582171
-OWNER_USERNAME = "rezreza_asarii"
 
-# KONEKSI BOT & DATABASE
+# KONEKSI BOT & DB
 bot = Client("global_protection_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 mongo = MongoClient(MONGO_URI)
 db = mongo["global_protect"]
 users = db["users"]
 activity = db["activity"]
+groups = db["groups"]
+
+# LOG
+async def log_to_channel(text):
+    try:
+        await bot.send_message(LOG_CHANNEL, text)
+    except:
+        pass
 
 # CEK IZIN
 def is_authorized(user_id):
     return user_id in SUDO_USERS or user_id in SUPPORT_USERS or user_id in WHITELIST
 
-# FUNGSI AMAN AMBIL TARGET
+# AMBIL TARGET
 def get_target_user(msg):
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
@@ -45,30 +54,15 @@ async def handle_gmute(_, msg):
         return
     target = get_target_user(msg)
     if not target:
-        return await msg.reply("Balas pesan pengguna atau berikan user_id.")
+        return await msg.reply("Balas pesan atau kirim user ID.")
     if msg.command[0] == "gmute":
         users.update_one({"_id": target}, {"$set": {"gmute": True}}, upsert=True)
-        await msg.reply("Pengguna dimute secara global.")
+        await msg.reply("Pengguna dimute global.")
+        await log_to_channel(f"[GMUTE] `{target}` oleh `{msg.from_user.id}`.")
     else:
         users.update_one({"_id": target}, {"$unset": {"gmute": ""}})
-        await msg.reply("Mute global dilepas.")
-
-# GKICK / UNGKICK
-@bot.on_message(filters.command(["gkick", "ungkick"]))
-async def handle_gkick(_, msg):
-    if not is_authorized(msg.from_user.id):
-        return
-    target = get_target_user(msg)
-    if not target:
-        return await msg.reply("Balas pesan pengguna atau berikan user_id.")
-    if msg.command[0] == "gkick":
-        users.update_one({"_id": target}, {"$set": {"gkick": True}}, upsert=True)
-        if msg.chat.type != "private":
-            await msg.chat.kick_member(target)
-        await msg.reply("Pengguna dikick secara global.")
-    else:
-        users.update_one({"_id": target}, {"$unset": {"gkick": ""}})
-        await msg.reply("Kick global dilepas.")
+        await msg.reply("Mute global dicabut.")
+        await log_to_channel(f"[UNGMUTE] `{target}` oleh `{msg.from_user.id}`.")
 
 # GBAN / UNGBAN
 @bot.on_message(filters.command(["gban", "ungban"]))
@@ -77,36 +71,44 @@ async def handle_gban(_, msg):
         return
     target = get_target_user(msg)
     if not target:
-        return await msg.reply("Balas pesan pengguna atau berikan user_id.")
+        return await msg.reply("Balas pesan atau kirim user ID.")
     if msg.command[0] == "gban":
         users.update_one({"_id": target}, {"$set": {"gban": True}}, upsert=True)
-        if msg.chat.type != "private":
-            await msg.chat.ban_member(target)
-        await msg.reply("Pengguna dibanned secara global.")
+        group_ids = groups.distinct("_id")
+        for group_id in group_ids:
+            try:
+                await bot.ban_chat_member(group_id, target)
+            except:
+                pass
+        await msg.reply("Pengguna dibanned global.")
+        await log_to_channel(f"[GBAN] `{target}` oleh `{msg.from_user.id}`.")
     else:
         users.update_one({"_id": target}, {"$unset": {"gban": ""}})
-        await msg.reply("Ban global dilepas.")
+        await msg.reply("Ban global dicabut.")
+        await log_to_channel(f"[UNGBAN] `{target}` oleh `{msg.from_user.id}`.")
 
-# CEK SAAT USER MENGIRIM PESAN (RESTRIKSI GLOBAL)
+# MODERASI PESAN
 @bot.on_message(filters.group)
 async def enforce_restrictions(_, msg):
+    if not msg.from_user:
+        return
     user_id = msg.from_user.id
     data = users.find_one({"_id": user_id})
     if not data:
         return
     try:
         if data.get("gban"):
-            await msg.chat.ban_member(user_id)
-        elif data.get("gkick"):
-            await msg.chat.kick_member(user_id)
+            await bot.ban_chat_member(msg.chat.id, user_id)
+            await log_to_channel(f"[ENFORCE] `{user_id}` dibanned di `{msg.chat.title}`.")
         elif data.get("gmute"):
-            await msg.chat.restrict_member(user_id, ChatPermissions(can_send_messages=False))
-    except Exception:
+            await bot.restrict_chat_member(msg.chat.id, user_id, ChatPermissions(can_send_messages=False))
+            await log_to_channel(f"[ENFORCE] `{user_id}` dimute di `{msg.chat.title}`.")
+    except:
         pass
 
-# ANTI GCAST DENGAN PILIHAN AKSI: GMUTE / GKICK / GBAN
+# DETEKSI GCAST
 @bot.on_message(filters.group & ~filters.service)
-async def detect_gcast_user(_, msg):
+async def detect_gcast(_, msg):
     if not msg.from_user or msg.sender_chat:
         return
     user_id = msg.from_user.id
@@ -119,91 +121,87 @@ async def detect_gcast_user(_, msg):
         timestamps = [t for t in recent.get("timestamps", []) if now - t < 60]
         chats.add(chat_id)
         timestamps.append(now)
-
-        activity.update_one(
-            {"_id": user_id},
-            {"$set": {"chats": list(chats), "timestamps": timestamps}},
-            upsert=True
-        )
-
+        activity.update_one({"_id": user_id}, {"$set": {"chats": list(chats), "timestamps": timestamps}})
         if len(chats) >= 5:
-            # GANTI PILIHAN DI BAWAH SESUAI AKSI YANG DIINGINKAN:
-            users.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {
-                        "gban": False,
-                        "gmute": True,
-                        "gkick": False
-                    }
-                },
-                upsert=True
-            )
+            users.update_one({"_id": user_id}, {"$set": {"gmute": True}}, upsert=True)
             try:
-                await msg.chat.ban_member(user_id)
-            except: pass
+                await bot.ban_chat_member(chat_id, user_id)
+            except:
+                pass
+            await log_to_channel(f"[GCAST DETECTED] `{user_id}` di `{msg.chat.title}`.")
             try:
-                await bot.send_message(
-                    OWNER_ID,
-                    f"User {msg.from_user.mention} (`{user_id}`) terdeteksi GCAST. Aksi: GBAN, GMUTE, GKICK telah diterapkan."
-                )
-            except: pass
+                await bot.send_message(OWNER_ID, f"User {msg.from_user.mention} (`{user_id}`) GMUTE karena GCAST.")
+            except:
+                pass
     else:
         activity.insert_one({"_id": user_id, "chats": [chat_id], "timestamps": [now]})
 
-# ANTI CHANNEL SENDER (FORWARD DARI CHANNEL)
+# BLOKIR CHANNEL SENDER
 @bot.on_message(filters.group)
 async def block_channel_sender(_, msg):
     if msg.sender_chat and msg.sender_chat.type == "channel":
         try:
             await msg.delete()
             await msg.chat.ban_sender_chat(msg.sender_chat.id)
-            await bot.send_message(
-                OWNER_ID,
-                f"Channel [{msg.sender_chat.title}](https://t.me/{msg.sender_chat.username}) diblokir dari grup {msg.chat.title} karena kirim pesan via sender_chat."
-            )
-        except Exception:
-            pass
-
-# ANTI BOT MASUK GRUP
-@bot.on_chat_member_updated()
-async def block_bot_join(_, event):
-    if event.new_chat_member.user.is_bot and event.new_chat_member.user.id != (await bot.get_me()).id:
-        try:
-            await bot.kick_chat_member(event.chat.id, event.new_chat_member.user.id)
-            await bot.send_message(
-                OWNER_ID,
-                f"Bot @{event.new_chat_member.user.username or event.new_chat_member.user.first_name} dikick dari grup {event.chat.title}."
-            )
+            await log_to_channel(f"[CHANNEL BLOCKED] `{msg.sender_chat.title}` di `{msg.chat.title}`.")
+            await bot.send_message(OWNER_ID, f"Channel `{msg.sender_chat.title}` diblok dari `{msg.chat.title}`.")
         except:
             pass
 
-# CEK USER MASUK GRUP UNTUK GBAN/GMUTE/GKICK
+# HANDLER UPDATE MEMBER (Gabungan)
 @bot.on_chat_member_updated()
-async def on_user_join(_, event):
-    if event.new_chat_member.status != "member":
-        return
-    user_id = event.new_chat_member.user.id
-    data = users.find_one({"_id": user_id})
-    if not data:
-        return
+async def chat_member_handler(_, event):
     try:
-        if data.get("gban"):
-            await bot.ban_chat_member(event.chat.id, user_id)
-        elif data.get("gkick"):
-            await bot.kick_chat_member(event.chat.id, user_id)
-        elif data.get("gmute"):
-            await bot.restrict_chat_member(event.chat.id, user_id, ChatPermissions(can_send_messages=False))
-    except Exception:
+        bot_id = (await bot.get_me()).id
+        user = event.new_chat_member.user
+        chat_id = event.chat.id
+
+        # Jika bot baru masuk ke grup
+        if user.id == bot_id:
+            groups.update_one({"_id": chat_id}, {"$set": {"title": event.chat.title}}, upsert=True)
+
+        # Jika bot lain masuk grup
+        elif user.is_bot:
+            await bot.kick_chat_member(chat_id, user.id)
+            await log_to_channel(f"[ANTI BOT] `{user.first_name}` dikick dari `{event.chat.title}`.")
+            try:
+                await bot.send_message(OWNER_ID, f"Bot @{user.username or user.first_name} dikick dari grup `{event.chat.title}`.")
+            except:
+                pass
+
+        # User biasa join, cek hukuman
+        elif event.new_chat_member.status == "member":
+            data = users.find_one({"_id": user.id})
+            if not data:
+                return
+            if data.get("gban"):
+                await bot.ban_chat_member(chat_id, user.id)
+            elif data.get("gmute"):
+                await bot.restrict_chat_member(chat_id, user.id, ChatPermissions(can_send_messages=False))
+            await log_to_channel(f"[AUTO JOIN ACTION] `{user.id}` dikenai hukuman di `{event.chat.title}`.")
+    except:
         pass
 
-# START DAN HELP COMMAND
+# START DAN HELP
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, msg):
-    await msg.reply("Halo! Saya adalah Emilia bot AntiGcast proteksi global Yang Bertema Anime Dari Re:Zero Yang Sekarang Menjaga Keamanan Di Grup Ovanime Indonesia.")
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Tambahkan Bot", url="https://t.me/emiliarezero_robot?startgroup=true")],
+            [
+                InlineKeyboardButton("👥 Support Group", url="https://t.me/Grup_Ovanime_Indo"),
+                InlineKeyboardButton("📢 Channel Updates", url="https://t.me/TE_Team_Official")
+            ]
+        ]
+    )
+    await msg.reply(
+        "Halo! Saya adalah Emilia bot proteksi global bertema anime Re:Zero. Gunakan saya untuk melindungi grup kamu dari spam dan GCAST!",
+        reply_markup=keyboard
+    )
 
 @bot.on_message(filters.command("help") & filters.private)
-async def help_command(_, msg):
-    await msg.reply("Perintah hanya tersedia untuk admin dan terbatas fungsinya.")
+async def help(_, msg):
+    await msg.reply("Perintah tersedia untuk admin. Gunakan dengan bijak.")
 
+# JALANKAN BOT
 bot.run()
